@@ -163,7 +163,7 @@ class EmotionDetectionPipeline:
 if __name__ == "__main__":
     model_path = "path_to_model"
     recordings_path = "path_to_recordings"
-    openai_api_key = "***********"  # the key must be updated each time
+    openai_api_key = "***********"  # i can't put the key because github didn't allow me 
 
     pipeline = EmotionDetectionPipeline(model_path, recordings_path, openai_api_key)
 
@@ -171,3 +171,4 @@ if __name__ == "__main__":
     pipeline.analyze_recording()
 
    
+
