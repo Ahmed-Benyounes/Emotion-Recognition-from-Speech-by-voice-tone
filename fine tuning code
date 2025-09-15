@@ -1,0 +1,266 @@
+# Emotion Recognition Fine-tuning with XLSR-53 and RAVDESS
+# For Google Colab - Run this to fine-tune XLSR-53 for your 6 emotions
+
+
+# Disable wandb logging
+import os
+os.environ["WANDB_DISABLED"] = "true"
+os.environ["WANDB_MODE"] = "disabled"
+
+import torch
+import torchaudio
+import librosa
+import numpy as np
+import pandas as pd
+from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification, TrainingArguments, Trainer
+from datasets import Dataset
+import os
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+import random
+from google.colab import drive
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Set up paths
+DATA_PATH = '/content/drive/MyDrive/data'
+XLSR_MODEL_PATH = f'{DATA_PATH}/xlsr_53_56k.pt'
+RAVDESS_PATH = f'{DATA_PATH}/ravdess'
+MY_RECORDING_PATH = f'{DATA_PATH}/my_recording'
+OUTPUT_MODEL_PATH = f'{DATA_PATH}/emotion_xlsr_model'
+
+# Your 6 target emotions
+TARGET_EMOTIONS = ['happy', 'sad', 'angry', 'excited', 'fear', 'neutral']
+
+# RAVDESS emotion mapping to your emotions
+RAVDESS_TO_TARGET = {
+    '01': 'neutral',    # neutral
+    '02': 'neutral',    # calm -> neutral
+    '03': 'happy',      # happy
+    '04': 'sad',        # sad
+    '05': 'angry',      # angry
+    '06': 'fear',       # fearful -> fear
+    '07': 'angry',      # disgust -> angry
+    '08': 'excited'     # surprised -> excited
+}
+
+print("Setting up emotion recognition fine-tuning...")
+print(f"Target emotions: {TARGET_EMOTIONS}")
+
+# Initialize feature extractor and label encoder
+feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-large-xlsr-53")
+label_encoder = LabelEncoder()
+label_encoder.fit(TARGET_EMOTIONS)
+
+def load_ravdess_data():
+    """Load and process RAVDESS dataset"""
+    audio_paths = []
+    emotions = []
+
+    # Walk through RAVDESS directory
+    for root, dirs, files in os.walk(RAVDESS_PATH):
+        for file in files:
+            if file.endswith('.wav'):
+                # RAVDESS filename format: 03-01-06-01-02-01-12.wav
+                # The 3rd number is emotion (06 in this example)
+                parts = file.split('-')
+                if len(parts) >= 3:
+                    emotion_code = parts[2]
+                    if emotion_code in RAVDESS_TO_TARGET:
+                        target_emotion = RAVDESS_TO_TARGET[emotion_code]
+                        audio_paths.append(os.path.join(root, file))
+                        emotions.append(target_emotion)
+
+    print(f"Loaded {len(audio_paths)} ravdess samples")
+    return audio_paths, emotions
+
+def preprocess_audio(audio_path, target_length=16000*3):  # 3 seconds
+    """Load and preprocess audio file"""
+    try:
+        # Load audio
+        speech, sr = librosa.load(audio_path, sr=16000)
+
+        # Pad or truncate to target length
+        if len(speech) > target_length:
+            speech = speech[:target_length]
+        else:
+            speech = np.pad(speech, (0, target_length - len(speech)), mode='constant')
+
+        return speech
+    except Exception as e:
+        print(f"Error processing {audio_path}: {e}")
+        return np.zeros(target_length)
+
+def create_dataset(audio_paths, emotions):
+    """Create dataset for training"""
+    processed_audios = []
+    valid_emotions = []
+
+    print("Processing audio files...")
+    for i, (path, emotion) in enumerate(zip(audio_paths, emotions)):
+        if i % 100 == 0:
+            print(f"Processed {i}/{len(audio_paths)} files")
+
+        audio = preprocess_audio(path)
+        if audio is not None:
+            processed_audios.append(audio)
+            valid_emotions.append(emotion)
+
+    # Create dataset
+    dataset = Dataset.from_dict({
+        'audio': processed_audios,
+        'labels': label_encoder.transform(valid_emotions)
+    })
+
+    return dataset
+
+# Load RAVDESS data
+print("Loading RAVDESS dataset...")
+audio_paths, emotions = load_ravdess_data()
+
+# Create dataset
+dataset = create_dataset(audio_paths, emotions)
+print(f"Created dataset with {len(dataset)} samples")
+
+# Split dataset
+train_size = int(0.8 * len(dataset))
+train_dataset = dataset.select(range(train_size))
+eval_dataset = dataset.select(range(train_size, len(dataset)))
+
+print(f"Training samples: {len(train_dataset)}")
+print(f"Evaluation samples: {len(eval_dataset)}")
+
+# Initialize model
+print("Loading XLSR-53 model...")
+model = Wav2Vec2ForSequenceClassification.from_pretrained(
+    "facebook/wav2vec2-large-xlsr-53",
+    num_labels=len(TARGET_EMOTIONS),
+    label2id={label: i for i, label in enumerate(TARGET_EMOTIONS)},
+    id2label={i: label for i, label in enumerate(TARGET_EMOTIONS)}
+)
+
+# Freeze feature extractor (only train classification head)
+model.freeze_feature_encoder()
+print("Frozen feature extractor - only training classification head")
+
+def preprocess_function(batch):
+    """Preprocess batch for training"""
+    audio_arrays = [audio for audio in batch["audio"]]
+    inputs = feature_extractor(
+        audio_arrays,
+        sampling_rate=16000,
+        return_tensors="pt",
+        padding=True
+    )
+    inputs["labels"] = batch["labels"]
+    return inputs
+
+# Preprocess datasets
+print("Preprocessing datasets...")
+train_dataset = train_dataset.map(preprocess_function, batched=True)
+eval_dataset = eval_dataset.map(preprocess_function, batched=True)
+
+def compute_metrics(eval_pred):
+    """Compute accuracy metrics"""
+    predictions, labels = eval_pred
+    predictions = np.argmax(predictions, axis=1)
+    return {'accuracy': accuracy_score(labels, predictions)}
+
+# Training arguments - optimized for 30 minutes
+training_args = TrainingArguments(
+    output_dir=OUTPUT_MODEL_PATH,
+    num_train_epochs=3,  # Quick training
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,
+    warmup_steps=100,
+    logging_steps=50,
+    eval_strategy="steps",  # Fixed: was evaluation_strategy
+    eval_steps=100,
+    save_steps=200,
+    load_best_model_at_end=True,
+    metric_for_best_model="accuracy",
+    push_to_hub=False,
+)
+
+# Initialize trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    compute_metrics=compute_metrics,
+)
+
+print("Starting fine-tuning...")
+print("This will take approximately 30 minutes...")
+
+# Train the model
+trainer.train()
+
+# Save the model
+print("Saving fine-tuned model...")
+trainer.save_model(OUTPUT_MODEL_PATH)
+feature_extractor.save_pretrained(OUTPUT_MODEL_PATH)
+
+print(f"Model saved to: {OUTPUT_MODEL_PATH}")
+
+# Test with your recordings
+def test_with_my_recordings():
+    """Test the model with your pre-recorded samples"""
+    print("\nTesting with your recordings...")
+
+    if not os.path.exists(MY_RECORDING_PATH):
+        print(f"Warning: {MY_RECORDING_PATH} not found")
+        return
+
+    for emotion in TARGET_EMOTIONS:
+        emotion_path = os.path.join(MY_RECORDING_PATH, emotion)
+        if os.path.exists(emotion_path):
+            # Look for clip1.wav, clip2.wav, clip3.wav, bridge.wav
+            audio_files = [f for f in os.listdir(emotion_path) if f.endswith('.wav') and f.startswith('clip')]
+            if audio_files:
+                # Test first clip file
+                test_file = os.path.join(emotion_path, 'clip1.wav')
+                if os.path.exists(test_file):
+                    audio = preprocess_audio(test_file)
+
+                    # Get prediction
+                    inputs = feature_extractor(audio, sampling_rate=16000, return_tensors="pt")
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                        predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
+                        predicted_id = torch.argmax(predictions, dim=-1).item()
+                        predicted_emotion = TARGET_EMOTIONS[predicted_id]
+                        confidence = predictions[0][predicted_id].item()
+
+                    print(f"True: {emotion} | Predicted: {predicted_emotion} | Confidence: {confidence:.3f}")
+
+                    # Check if bridge.wav exists
+                    bridge_file = os.path.join(emotion_path, 'bridge.wav')
+                    bridge_exists = "✅" if os.path.exists(bridge_file) else "❌"
+                    clip_count = len([f for f in os.listdir(emotion_path) if f.startswith('clip') and f.endswith('.wav')])
+                    print(f"  📁 Clips: {clip_count}/3 | Bridge: {bridge_exists}")
+                else:
+                    print(f"❌ {emotion}: clip1.wav not found")
+            else:
+                print(f"❌ {emotion}: no clip files found")
+
+# Run test
+test_with_my_recordings()
+
+print("\n✅ Fine-tuning complete!")
+print(f"📁 Model saved at: {OUTPUT_MODEL_PATH}")
+print("🎯 Ready for real-time emotion detection!")
+
+# Save emotion mapping for later use
+import json
+emotion_mapping = {
+    'emotions': TARGET_EMOTIONS,
+    'label_encoder': {str(i): emotion for i, emotion in enumerate(TARGET_EMOTIONS)}
+}
+
+with open(f'{DATA_PATH}/emotion_mapping.json', 'w') as f:
+    json.dump(emotion_mapping, f)
+
+print("💾 Emotion mapping saved for real-time use!")
