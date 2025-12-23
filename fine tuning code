@@ -1,266 +1,420 @@
-# Emotion Recognition Fine-tuning with XLSR-53 and RAVDESS
-# For Google Colab - Run this to fine-tune XLSR-53 for your 6 emotions
-
-
-# Disable wandb logging
 import os
-os.environ["WANDB_DISABLED"] = "true"
-os.environ["WANDB_MODE"] = "disabled"
-
 import torch
-import torchaudio
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
 import librosa
 import numpy as np
-import pandas as pd
-from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification, TrainingArguments, Trainer
-from datasets import Dataset
-import os
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score
+from transformers import Wav2Vec2Config
+from tqdm import tqdm
 import random
-from google.colab import drive
 
-# Mount Google Drive
-drive.mount('/content/drive')
+# ----------------------------
+# Configuration ( 600 SAMPLES)
+EMOTION_LABELS = {'angry': 0, 'happy': 1, 'sad': 2, 'neutral': 3}
+SAMPLE_RATE = 16000
+MAX_LENGTH = 48000  # 3 seconds
+BATCH_SIZE = 16  
+LEARNING_RATE_CLASSIFIER = 5e-4
+LEARNING_RATE_ENCODER = 2e-5
+WARMUP_EPOCHS = 5  
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Set up paths
-DATA_PATH = '/content/drive/MyDrive/data'
-XLSR_MODEL_PATH = f'{DATA_PATH}/xlsr_53_56k.pt'
-RAVDESS_PATH = f'{DATA_PATH}/ravdess'
-MY_RECORDING_PATH = f'{DATA_PATH}/my_recording'
-OUTPUT_MODEL_PATH = f'{DATA_PATH}/emotion_xlsr_model'
+# Full paths
+BASE_DIR = r"C:\Users\bnahm\Desktop\emotion_voice_ai"
+MY_VOICES_PATH = os.path.join(BASE_DIR, "datasets", "my_voices")
+XLSR_CHECKPOINT_PATH = os.path.join(BASE_DIR, "pretrained", "xlsr_53_56k.pt")
+MODEL_SAVE_PATH = os.path.join(BASE_DIR, "models", "best_model_600.pth")
 
-# Your 6 target emotions
-TARGET_EMOTIONS = ['happy', 'sad', 'angry', 'excited', 'fear', 'neutral']
+# ----------------------------
+# Enhanced Audio Augmentation (TUNED FOR 600 SAMPLES)
+# ----------------------------
+def add_noise(audio, noise_factor=0.006):
+    """Add random Gaussian noise with variable intensity"""
+    noise_factor = np.random.uniform(0.002, noise_factor)
+    noise = np.random.randn(len(audio))
+    augmented = audio + noise_factor * noise
+    return augmented.astype(np.float32)
 
-# RAVDESS emotion mapping to your emotions
-RAVDESS_TO_TARGET = {
-    '01': 'neutral',    # neutral
-    '02': 'neutral',    # calm -> neutral
-    '03': 'happy',      # happy
-    '04': 'sad',        # sad
-    '05': 'angry',      # angry
-    '06': 'fear',       # fearful -> fear
-    '07': 'angry',      # disgust -> angry
-    '08': 'excited'     # surprised -> excited
-}
+def pitch_shift(audio, sr=SAMPLE_RATE, n_steps=None):
+    """Shift pitch randomly"""
+    if n_steps is None:
+        n_steps = np.random.randint(-3, 4)  # -3 to +3 semitones
+    return librosa.effects.pitch_shift(audio, sr=sr, n_steps=n_steps)
 
-print("Setting up emotion recognition fine-tuning...")
-print(f"Target emotions: {TARGET_EMOTIONS}")
+def time_stretch(audio, rate=None):
+    """Stretch or compress time"""
+    if rate is None:
+        rate = np.random.uniform(0.85, 1.15)
+    return librosa.effects.time_stretch(audio, rate=rate)
 
-# Initialize feature extractor and label encoder
-feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-large-xlsr-53")
-label_encoder = LabelEncoder()
-label_encoder.fit(TARGET_EMOTIONS)
+def time_shift(audio, shift_max=0.2):
+    """Shift audio in time (circular shift)"""
+    shift = int(np.random.uniform(-shift_max, shift_max) * len(audio))
+    return np.roll(audio, shift)
 
-def load_ravdess_data():
-    """Load and process RAVDESS dataset"""
-    audio_paths = []
-    emotions = []
+def random_gain(audio, gain_range=(0.85, 1.15)):
+    """Apply random gain/volume change"""
+    gain = np.random.uniform(*gain_range)
+    return audio * gain
 
-    # Walk through RAVDESS directory
-    for root, dirs, files in os.walk(RAVDESS_PATH):
-        for file in files:
-            if file.endswith('.wav'):
-                # RAVDESS filename format: 03-01-06-01-02-01-12.wav
-                # The 3rd number is emotion (06 in this example)
-                parts = file.split('-')
-                if len(parts) >= 3:
-                    emotion_code = parts[2]
-                    if emotion_code in RAVDESS_TO_TARGET:
-                        target_emotion = RAVDESS_TO_TARGET[emotion_code]
-                        audio_paths.append(os.path.join(root, file))
-                        emotions.append(target_emotion)
+def apply_augmentation(audio, augment=True):
+    """Apply multiple random augmentations - slightly reduced probability with more data"""
+    if not augment:
+        return audio
+    
+    # Apply augmentations with 60% probability (reduced from 70% since we have more real data)
+    if np.random.rand() > 0.4:
+        # Each augmentation has independent probability
+        if np.random.rand() > 0.5:  # 50% chance
+            audio = add_noise(audio)
+        
+        if np.random.rand() > 0.6:  # 40% chance
+            audio = pitch_shift(audio)
+        
+        if np.random.rand() > 0.7:  # 30% chance
+            audio = time_stretch(audio)
+        
+        if np.random.rand() > 0.7:  # 30% chance
+            audio = time_shift(audio)
+        
+        if np.random.rand() > 0.6:  # 40% chance
+            audio = random_gain(audio)
+    
+    return audio
 
-    print(f"Loaded {len(audio_paths)} ravdess samples")
-    return audio_paths, emotions
+# ----------------------------
+# Audio Preprocessing
+# ----------------------------
+def load_and_preprocess_audio(file_path, target_sr=SAMPLE_RATE, max_len=MAX_LENGTH, augment=False):
+    audio, sr = librosa.load(file_path, sr=target_sr, mono=True)
+    audio, _ = librosa.effects.trim(audio, top_db=20)
+    
+    # Apply augmentation before padding
+    if augment:
+        audio = apply_augmentation(audio, augment=True)
+    
+    if len(audio) > max_len:
+        audio = audio[:max_len]
+    else:
+        padding = max_len - len(audio)
+        audio = np.pad(audio, (0, padding), mode='constant')
+    
+    # Normalize
+    audio = audio / (np.max(np.abs(audio)) + 1e-6)
+    return audio.astype(np.float32)
 
-def preprocess_audio(audio_path, target_length=16000*3):  # 3 seconds
-    """Load and preprocess audio file"""
-    try:
-        # Load audio
-        speech, sr = librosa.load(audio_path, sr=16000)
+# ----------------------------
+# Dataset with Stratified Split
+# ----------------------------
+class EmotionDataset(Dataset):
+    def __init__(self, file_paths, labels, augment=False):
+        self.file_paths = file_paths
+        self.labels = labels
+        self.augment = augment
+    
+    def __len__(self):
+        return len(self.file_paths)
+    
+    def __getitem__(self, idx):
+        audio = load_and_preprocess_audio(self.file_paths[idx], augment=self.augment)
+        return torch.tensor(audio, dtype=torch.float32), torch.tensor(self.labels[idx], dtype=torch.long)
 
-        # Pad or truncate to target length
-        if len(speech) > target_length:
-            speech = speech[:target_length]
-        else:
-            speech = np.pad(speech, (0, target_length - len(speech)), mode='constant')
-
-        return speech
-    except Exception as e:
-        print(f"Error processing {audio_path}: {e}")
-        return np.zeros(target_length)
-
-def create_dataset(audio_paths, emotions):
-    """Create dataset for training"""
-    processed_audios = []
-    valid_emotions = []
-
-    print("Processing audio files...")
-    for i, (path, emotion) in enumerate(zip(audio_paths, emotions)):
-        if i % 100 == 0:
-            print(f"Processed {i}/{len(audio_paths)} files")
-
-        audio = preprocess_audio(path)
-        if audio is not None:
-            processed_audios.append(audio)
-            valid_emotions.append(emotion)
-
-    # Create dataset
-    dataset = Dataset.from_dict({
-        'audio': processed_audios,
-        'labels': label_encoder.transform(valid_emotions)
-    })
-
-    return dataset
-
-# Load RAVDESS data
-print("Loading RAVDESS dataset...")
-audio_paths, emotions = load_ravdess_data()
-
-# Create dataset
-dataset = create_dataset(audio_paths, emotions)
-print(f"Created dataset with {len(dataset)} samples")
-
-# Split dataset
-train_size = int(0.8 * len(dataset))
-train_dataset = dataset.select(range(train_size))
-eval_dataset = dataset.select(range(train_size, len(dataset)))
-
-print(f"Training samples: {len(train_dataset)}")
-print(f"Evaluation samples: {len(eval_dataset)}")
-
-# Initialize model
-print("Loading XLSR-53 model...")
-model = Wav2Vec2ForSequenceClassification.from_pretrained(
-    "facebook/wav2vec2-large-xlsr-53",
-    num_labels=len(TARGET_EMOTIONS),
-    label2id={label: i for i, label in enumerate(TARGET_EMOTIONS)},
-    id2label={i: label for i, label in enumerate(TARGET_EMOTIONS)}
-)
-
-# Freeze feature extractor (only train classification head)
-model.freeze_feature_encoder()
-print("Frozen feature extractor - only training classification head")
-
-def preprocess_function(batch):
-    """Preprocess batch for training"""
-    audio_arrays = [audio for audio in batch["audio"]]
-    inputs = feature_extractor(
-        audio_arrays,
-        sampling_rate=16000,
-        return_tensors="pt",
-        padding=True
+def load_dataset(root_path, emotion_labels):
+    """Load dataset with stratified split"""
+    all_files = []
+    all_labels = []
+    
+    print(" Loading dataset...")
+    for emotion in ['angry', 'happy', 'sad', 'neutral']:
+        folder = os.path.join(root_path, emotion)
+        files = [f for f in os.listdir(folder) if f.endswith('.wav')]
+        label = emotion_labels[emotion]
+        
+        print(f"   {emotion.capitalize():8s}: {len(files)} files")
+        
+        for f in files:
+            all_files.append(os.path.join(folder, f))
+            all_labels.append(label)
+    
+    print(f" Loaded {len(all_files)} samples total")
+    
+    # Stratified 80/20 split (480 train, 120 val for 600 samples)
+    train_files, val_files, train_labels, val_labels = train_test_split(
+        all_files, all_labels, test_size=0.2, stratify=all_labels, random_state=42
     )
-    inputs["labels"] = batch["labels"]
-    return inputs
+    
+    print(f" Train: {len(train_files)} samples | Val: {len(val_files)} samples")
+    print(f"   (Per class: ~{len(train_files)//4} train, ~{len(val_files)//4} val)")
+    
+    return train_files, val_files, train_labels, val_labels
 
-# Preprocess datasets
-print("Preprocessing datasets...")
-train_dataset = train_dataset.map(preprocess_function, batched=True)
-eval_dataset = eval_dataset.map(preprocess_function, batched=True)
-
-def compute_metrics(eval_pred):
-    """Compute accuracy metrics"""
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    return {'accuracy': accuracy_score(labels, predictions)}
-
-# Training arguments - optimized for 30 minutes
-training_args = TrainingArguments(
-    output_dir=OUTPUT_MODEL_PATH,
-    num_train_epochs=3,  # Quick training
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    warmup_steps=100,
-    logging_steps=50,
-    eval_strategy="steps",  # Fixed: was evaluation_strategy
-    eval_steps=100,
-    save_steps=200,
-    load_best_model_at_end=True,
-    metric_for_best_model="accuracy",
-    push_to_hub=False,
-)
-
-# Initialize trainer
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    compute_metrics=compute_metrics,
-)
-
-print("Starting fine-tuning...")
-print("This will take approximately 30 minutes...")
-
-# Train the model
-trainer.train()
-
-# Save the model
-print("Saving fine-tuned model...")
-trainer.save_model(OUTPUT_MODEL_PATH)
-feature_extractor.save_pretrained(OUTPUT_MODEL_PATH)
-
-print(f"Model saved to: {OUTPUT_MODEL_PATH}")
-
-# Test with your recordings
-def test_with_my_recordings():
-    """Test the model with your pre-recorded samples"""
-    print("\nTesting with your recordings...")
-
-    if not os.path.exists(MY_RECORDING_PATH):
-        print(f"Warning: {MY_RECORDING_PATH} not found")
-        return
-
-    for emotion in TARGET_EMOTIONS:
-        emotion_path = os.path.join(MY_RECORDING_PATH, emotion)
-        if os.path.exists(emotion_path):
-            # Look for clip1.wav, clip2.wav, clip3.wav, bridge.wav
-            audio_files = [f for f in os.listdir(emotion_path) if f.endswith('.wav') and f.startswith('clip')]
-            if audio_files:
-                # Test first clip file
-                test_file = os.path.join(emotion_path, 'clip1.wav')
-                if os.path.exists(test_file):
-                    audio = preprocess_audio(test_file)
-
-                    # Get prediction
-                    inputs = feature_extractor(audio, sampling_rate=16000, return_tensors="pt")
-                    with torch.no_grad():
-                        outputs = model(**inputs)
-                        predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
-                        predicted_id = torch.argmax(predictions, dim=-1).item()
-                        predicted_emotion = TARGET_EMOTIONS[predicted_id]
-                        confidence = predictions[0][predicted_id].item()
-
-                    print(f"True: {emotion} | Predicted: {predicted_emotion} | Confidence: {confidence:.3f}")
-
-                    # Check if bridge.wav exists
-                    bridge_file = os.path.join(emotion_path, 'bridge.wav')
-                    bridge_exists = "✅" if os.path.exists(bridge_file) else "❌"
-                    clip_count = len([f for f in os.listdir(emotion_path) if f.startswith('clip') and f.endswith('.wav')])
-                    print(f"  📁 Clips: {clip_count}/3 | Bridge: {bridge_exists}")
-                else:
-                    print(f"❌ {emotion}: clip1.wav not found")
+# ----------------------------
+# Model: 12 Unfrozen Layers + Strong Head
+# ----------------------------
+class EmotionClassifier(nn.Module):
+    def __init__(self, num_classes=4, unfreeze_layers=12):
+        super().__init__()
+        from transformers import Wav2Vec2Model
+        config = Wav2Vec2Config.from_pretrained("facebook/wav2vec2-large-xlsr-53")
+        self.wav2vec2 = Wav2Vec2Model(config)
+        
+        # Load local Fairseq checkpoint
+        if os.path.exists(XLSR_CHECKPOINT_PATH):
+            ckpt = torch.load(XLSR_CHECKPOINT_PATH, map_location="cpu", weights_only=False)
+            state_dict = ckpt["model"]
+            new_dict = {}
+            for k, v in state_dict.items():
+                new_k = k.replace("w2v_model.", "wav2vec2.") if k.startswith("w2v_model.") else k
+                new_dict[new_k] = v
+            model_state = self.wav2vec2.state_dict()
+            pretrained = {k: v for k, v in new_dict.items() if k in model_state and v.shape == model_state[k].shape}
+            self.wav2vec2.load_state_dict(pretrained, strict=False)
+            print(f" Loaded XLSR base model")
+        else:
+            raise FileNotFoundError(f"XLSR not found at {XLSR_CHECKPOINT_PATH}")
+        
+        #  Freeze feature extractor
+        for param in self.wav2vec2.feature_extractor.parameters():
+            param.requires_grad = False
+        
+        #  Unfreeze last N transformer layers
+        total_layers = len(self.wav2vec2.encoder.layers)
+        freeze_until = total_layers - unfreeze_layers
+        
+        for i, layer in enumerate(self.wav2vec2.encoder.layers):
+            if i < freeze_until:
+                for param in layer.parameters():
+                    param.requires_grad = False
             else:
-                print(f"❌ {emotion}: no clip files found")
+                for param in layer.parameters():
+                    param.requires_grad = True
+        
+        print(f" Unfroze last {unfreeze_layers} transformer layers (out of {total_layers})")
+        
+        #  Enhanced classification head with dropout tuned for 600 samples
+        self.classifier = nn.Sequential(
+            nn.Linear(1024, 768),
+            nn.BatchNorm1d(768),
+            nn.ReLU(),
+            nn.Dropout(0.4),  # Kept same - good balance
+            
+            nn.Linear(768, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.45),  # Slightly reduced from 0.5
+            
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.35),  # Reduced from 0.4 - less regularization needed
+            
+            nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, x):
+        features = self.wav2vec2(x).last_hidden_state
+        pooled = features.mean(dim=1)
+        return self.classifier(pooled)
 
-# Run test
-test_with_my_recordings()
+# ----------------------------
+# Learning Rate Warmup Scheduler
+# ----------------------------
+class WarmupScheduler:
+    def __init__(self, optimizer, warmup_epochs, base_lrs):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.base_lrs = base_lrs
+        self.current_epoch = 0
+    
+    def step(self):
+        if self.current_epoch < self.warmup_epochs:
+            warmup_factor = (self.current_epoch + 1) / self.warmup_epochs
+            for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+                param_group['lr'] = base_lr * warmup_factor
+        self.current_epoch += 1
 
-print("\n✅ Fine-tuning complete!")
-print(f"📁 Model saved at: {OUTPUT_MODEL_PATH}")
-print("🎯 Ready for real-time emotion detection!")
+# ----------------------------
+# Training with Per-Class Metrics
+# ----------------------------
+def train():
+    print("=" * 80)
+    print(" Starting training on 600 BALANCED SAMPLES (150 per emotion)")
+    print("=" * 80)
+    
+    # Load data with stratified split
+    train_files, val_files, train_labels, val_labels = load_dataset(MY_VOICES_PATH, EMOTION_LABELS)
+    
+    train_ds = EmotionDataset(train_files, train_labels, augment=True)
+    val_ds = EmotionDataset(val_files, val_labels, augment=False)
+    
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    
+    model = EmotionClassifier(unfreeze_layers=12).to(DEVICE)
+    
+    # Label smoothing for better generalization
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    # Separate learning rates
+    optimizer = optim.AdamW([
+        {'params': model.wav2vec2.encoder.parameters(), 'lr': LEARNING_RATE_ENCODER},
+        {'params': model.classifier.parameters(), 'lr': LEARNING_RATE_CLASSIFIER}
+    ], weight_decay=1e-4)
+    
+    # Warmup scheduler
+    warmup_scheduler = WarmupScheduler(
+        optimizer, 
+        WARMUP_EPOCHS, 
+        [LEARNING_RATE_ENCODER, LEARNING_RATE_CLASSIFIER]
+    )
+    
+    # Main scheduler
+    main_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=7, verbose=True
+    )
+    
+    os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
+    
+    best_acc = 0.0
+    patience_counter = 0
+    early_stop_patience = 15  # Increased patience with more data
+    
+    print(f"\n Training on {DEVICE} for up to {EPOCHS} epochs...")
+    print(f" Warmup: {WARMUP_EPOCHS} epochs | Early stopping patience: {early_stop_patience}")
+    print(f" Batch size: {BATCH_SIZE} | Augmentation: Enabled\n")
+    
+    for epoch in range(EPOCHS):
+        # Warmup phase
+        if epoch < WARMUP_EPOCHS:
+            warmup_scheduler.step()
+        
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        # Per-class tracking
+        train_correct_per_class = {i: 0 for i in range(4)}
+        train_total_per_class = {i: 0 for i in range(4)}
+        
+        for audio, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", ncols=100):
+            audio, labels = audio.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(audio)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            train_loss += loss.item()
+            preds = outputs.argmax(dim=1)
+            train_correct += (preds == labels).sum().item()
+            train_total += labels.size(0)
+            
+            # Per-class accuracy
+            for i in range(4):
+                mask = labels == i
+                train_correct_per_class[i] += (preds[mask] == labels[mask]).sum().item()
+                train_total_per_class[i] += mask.sum().item()
+        
+        train_acc = train_correct / train_total
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # Validation phase
+        model.eval()
+        val_correct = 0
+        val_total = 0
+        val_loss = 0.0
+        
+        # Per-class validation tracking
+        val_correct_per_class = {i: 0 for i in range(4)}
+        val_total_per_class = {i: 0 for i in range(4)}
+        
+        with torch.no_grad():
+            for audio, labels in val_loader:
+                audio, labels = audio.to(DEVICE), labels.to(DEVICE)
+                outputs = model(audio)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                preds = outputs.argmax(dim=1)
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+                
+                # Per-class accuracy
+                for i in range(4):
+                    mask = labels == i
+                    val_correct_per_class[i] += (preds[mask] == labels[mask]).sum().item()
+                    val_total_per_class[i] += mask.sum().item()
+        
+        val_acc = val_correct / val_total
+        avg_val_loss = val_loss / len(val_loader)
+        
+        # Get current learning rates
+        current_lrs = [param_group['lr'] for param_group in optimizer.param_groups]
+        
+        # Print epoch summary
+        print(f"\n{'='*80}")
+        print(f" Epoch {epoch+1}/{EPOCHS}")
+        print(f"{'='*80}")
+        print(f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f} ({train_correct}/{train_total})")
+        print(f"Val Loss:   {avg_val_loss:.4f} | Val Acc:   {val_acc:.4f} ({val_correct}/{val_total})")
+        print(f"LR: Encoder={current_lrs[0]:.2e}, Classifier={current_lrs[1]:.2e}")
+        
+        # Per-class validation accuracy
+        print(f"\n Per-Class Validation Accuracy:")
+        emotion_names = ['Angry', 'Happy', 'Sad', 'Neutral']
+        for i in range(4):
+            if val_total_per_class[i] > 0:
+                acc = val_correct_per_class[i] / val_total_per_class[i]
+                print(f"   {emotion_names[i]:8s}: {acc:.4f} ({val_correct_per_class[i]}/{val_total_per_class[i]})")
+            else:
+                print(f"   {emotion_names[i]:8s}: N/A")
+        
+        # Save best model
+        if val_acc > best_acc:
+            best_acc = val_acc
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'train_acc': train_acc,
+                'val_acc_per_class': {emotion_names[i]: val_correct_per_class[i] / val_total_per_class[i] 
+                                     for i in range(4) if val_total_per_class[i] > 0}
+            }, MODEL_SAVE_PATH)
+            print(f"\n New best model saved! (Val Acc: {val_acc:.4f})")
+        else:
+            patience_counter += 1
+            print(f"\n No improvement for {patience_counter} epochs")
+        
+        # Early stopping
+        if patience_counter >= early_stop_patience:
+            print(f"\n Early stopping triggered after {epoch+1} epochs")
+            break
+        
+        # Apply main scheduler after warmup
+        if epoch >= WARMUP_EPOCHS:
+            main_scheduler.step(val_acc)
+    
+    print(f"\n{'='*80}")
+    print(f" Training complete!")
+    print(f" Best validation accuracy: {best_acc:.4f} ({best_acc*100:.1f}%)")
+    print(f" Model saved to: {MODEL_SAVE_PATH}")
+    print(f"{'='*80}")
+    
+    # Load best model and show final per-class stats
+    checkpoint = torch.load(MODEL_SAVE_PATH, map_location=DEVICE, weights_only=False)
+    if 'val_acc_per_class' in checkpoint:
+        print(f"\n Best Model - Per-Class Validation Accuracy:")
+        for emotion, acc in checkpoint['val_acc_per_class'].items():
+            print(f"   {emotion:8s}: {acc:.4f} ({acc*100:.1f}%)")
 
-# Save emotion mapping for later use
-import json
-emotion_mapping = {
-    'emotions': TARGET_EMOTIONS,
-    'label_encoder': {str(i): emotion for i, emotion in enumerate(TARGET_EMOTIONS)}
-}
-
-with open(f'{DATA_PATH}/emotion_mapping.json', 'w') as f:
-    json.dump(emotion_mapping, f)
-
-print("💾 Emotion mapping saved for real-time use!")
+if __name__ == "__main__":
+    train()
