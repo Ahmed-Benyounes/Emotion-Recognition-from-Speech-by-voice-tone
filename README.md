@@ -7,7 +7,7 @@ This project focuses on designing and implementing a deep learning model to reco
 - 🎙️ **Speech Emotion Recognition**: Detects emotions such as happiness, sadness, anger, and neutrality from voice input.  
 - 🌐 **Language-Independent**: Works on vocal tone rather than linguistic meaning, ensuring cross-lingual applicability.  
 - 🎭 **Voice-Over Integration**: Includes pre-recorded voice-over samples for training and testing.  
-- 🤖 **Generative AI Experimentation**: Explored integration with ChatGPT to enable context-aware emotional responses.  
+- 🤖 **Generative AI Experimentation**: Explored integration with Gemini to enable context-aware emotional responses.  
 
 ## Technical Details
 - **Datasets**:  
